@@ -1,7 +1,7 @@
 use dynamic_multi_reducer::{
     event::Event,
-    reducer::{DynamicMultiReducer, EventSender, SourceSink},
-    stream::{InitStream, InitStreamFactory},
+    reducer::{DynamicMultiReducer, EventEmitter, Sink},
+    stream::{StreamProcessor, StreamProcessorFactory},
 };
 use futures::{Future, SinkExt, StreamExt, TryFutureExt};
 use std::fmt::Debug;
@@ -45,8 +45,8 @@ impl PartialEq for AddrWrap {
     }
 }
 
-impl EventSender<MyMessage> for AddrWrap {
-    fn send(&mut self, event: Event<MyMessage>) {
+impl EventEmitter<MyMessage> for AddrWrap {
+    fn emit(&mut self, event: Event<MyMessage>) {
         self.sender.try_send(event).unwrap();
     }
 }
@@ -54,7 +54,7 @@ impl EventSender<MyMessage> for AddrWrap {
 pub struct ReceiverToUi {
     receiver: Option<Receiver<(usize, MyMessage)>>,
 }
-impl SourceSink<MyMessage> for ReceiverToUi {
+impl Sink<MyMessage> for ReceiverToUi {
     fn set_receiver(&mut self, receiver: Receiver<(usize, MyMessage)>) {
         self.receiver = Some(receiver);
     }
@@ -87,14 +87,14 @@ impl Future for ReceiverToUi {
     }
 }
 pub struct StreamFactory {}
-impl InitStreamFactory<MyMessage> for StreamFactory {
-    fn new_stream_initializer(
+impl StreamProcessorFactory<MyMessage> for StreamFactory {
+    fn build(
         &self,
         buffer_sender: Sender<(usize, MyMessage)>,
         receiver: Receiver<Result<Vec<u8>, std::io::Error>>,
         _connection_id: usize,
         _reserved: usize
-    ) -> Box<dyn InitStream<MyMessage> + Send> {
+    ) -> Box<dyn StreamProcessor<MyMessage> + Send> {
         // TODO: get encoding associated with reserved
         Box::new(StreamInitiazer::new(buffer_sender, String::new(), receiver))
     }
@@ -104,7 +104,8 @@ impl InitStreamFactory<MyMessage> for StreamFactory {
 /// and spawns futures for both of them
 #[derive(Debug)]
 pub struct StreamInitiazer<MyMessage> {
-    buffer_sender: Sender<(usize, MyMessage)>,
+    /// Sending part of a source to sink channel
+    source_to_sink: Sender<(usize, MyMessage)>,
     encoding: String,
     receiver: Option<Receiver<Result<Vec<u8>, std::io::Error>>>,
 }
@@ -119,7 +120,7 @@ impl StreamInitiazer<MyMessage> {
         receiver: Receiver<Result<Vec<u8>, std::io::Error>>,
     ) -> Self {
         StreamInitiazer {
-            buffer_sender,
+            source_to_sink: buffer_sender,
             encoding,
             receiver: Some(receiver),
         }
@@ -134,18 +135,18 @@ impl StreamInitiazer<MyMessage> {
     
     // Set's up a chain of futures to read from a socket stream and send corresponsing events
     // using reducer_event_sender
-    fn spawn_reader1(&mut self, reader: OwnedReadHalf, connection_id: usize,
+    fn spawn_reader1(&mut self, reader: OwnedReadHalf, source_id: usize,
         reducer_event_sender: Sender<Event<MyMessage>>) {
-            let receiver_fut = PollSender::new(self.buffer_sender.clone());
+            let receiver_fut = PollSender::new(self.source_to_sink.clone());
             let framed_reader = FramedRead::new(reader, MessageCodec::new(self.encoding.clone()));
             let cm_tx = reducer_event_sender.clone();
             let fut =
                 framed_reader
                     .map(move |buf| match buf {
-                        Ok(b) => Ok((connection_id, b)),
+                        Ok(b) => Ok((source_id, b)),
                         Err(err) => {
                             cm_tx
-                                .try_send(Event::Disconnected { connection_id })
+                                .try_send(Event::Disconnected { source_id })
                                 .unwrap();
                             Err(err)
                         }
@@ -154,24 +155,24 @@ impl StreamInitiazer<MyMessage> {
                         std::io::Error::new(std::io::ErrorKind::Other, "error sending")
                     }));
             tokio::spawn(fut.and_then(move |_| {
-                reducer_event_sender.try_send(Event::Disconnected { connection_id }).unwrap();
+                reducer_event_sender.try_send(Event::Disconnected { source_id }).unwrap();
                 futures::future::ok(())
             }));
     }
 
     // Same but with another codec that returns same message type
-    fn spawn_reader2(&mut self, reader: OwnedReadHalf, connection_id: usize,
+    fn spawn_reader2(&mut self, reader: OwnedReadHalf, source_id: usize,
         reducer_event_sender: Sender<Event<MyMessage>>) {
-            let receiver_fut = PollSender::new(self.buffer_sender.clone());
+            let receiver_fut = PollSender::new(self.source_to_sink.clone());
             let framed_reader = FramedRead::new(reader, MessageCodec2::new(self.encoding.clone()));
             let cm_tx = reducer_event_sender.clone();
             let fut =
                 framed_reader
                     .map(move |buf| match buf {
-                        Ok(b) => Ok((connection_id, b)),
+                        Ok(b) => Ok((source_id, b)),
                         Err(err) => {
                             cm_tx
-                                .try_send(Event::Disconnected { connection_id })
+                                .try_send(Event::Disconnected { source_id })
                                 .unwrap();
                             Err(err)
                         }
@@ -180,27 +181,27 @@ impl StreamInitiazer<MyMessage> {
                         std::io::Error::new(std::io::ErrorKind::Other, "error sending")
                     }));
             tokio::spawn(fut.and_then(move |_| {
-                reducer_event_sender.try_send(Event::Disconnected { connection_id }).unwrap();
+                reducer_event_sender.try_send(Event::Disconnected { source_id }).unwrap();
                 futures::future::ok(())
             }));
     }
 }
 
-impl InitStream<MyMessage> for StreamInitiazer<MyMessage> {
-    fn init_stream(
+impl StreamProcessor<MyMessage> for StreamInitiazer<MyMessage> {
+    fn setup(
         &mut self,
         reserved: usize,
-        connection_id: usize,
+        source_id: usize,
         stream: tokio::net::TcpStream,
         // This is a one unique channel for events from reducer
-        reducer_event_sender: Sender<Event<MyMessage>>,
+        reducer_event_emitter: Sender<Event<MyMessage>>,
     ) {
         let (reader, writer) = stream.into_split();
         self.spawn_writer(writer);
         if reserved == 1 {
-            self.spawn_reader1(reader, connection_id, reducer_event_sender);
+            self.spawn_reader1(reader, source_id, reducer_event_emitter);
         } else {
-            self.spawn_reader2(reader, connection_id, reducer_event_sender);
+            self.spawn_reader2(reader, source_id, reducer_event_emitter);
         }
     }
 }

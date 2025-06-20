@@ -16,6 +16,7 @@
 //!  Streams data from multiple sources to sink1 and sink2 and backwards,
 //!  Sources and sinks can be added on the fly
 
+
 use std::{
     collections::HashMap,
     sync::{
@@ -28,43 +29,40 @@ use log::info;
 use futures::Future;
 use tokio::sync::mpsc::{Receiver, Sender};
 use std::fmt::Debug;
-use crate::{event::Event, stream::InitStreamFactory, connect::Connector};
+use crate::{event::Event, stream::StreamProcessorFactory, connect::Connector};
 
 #[derive(Default)]
-pub struct InnerMap<M: Sized + Default + Clone + Send + Debug, T: PartialEq + Clone + EventSender<M>> {
+pub struct InnerMap<M: Sized + Default + Clone + Send + Debug, T: PartialEq + Clone + EventEmitter<M>> {
     pub map: Mutex<HashMap<usize, T>>,
+    pub next_source_id: AtomicUsize,
     p: PhantomData<M>
 }
 
-impl<M: Sized + Default + Clone + Send + Debug, T: PartialEq + Clone + EventSender<M>> InnerMap<M, T> {
+impl<M: Sized + Default + Clone + Send + Debug, T: PartialEq + Clone + EventEmitter<M>> InnerMap<M, T> {
     pub fn new() -> Self {
         InnerMap {
             map: Mutex::new(HashMap::new()),
-            p: PhantomData
+            p: PhantomData,
+            next_source_id: AtomicUsize::new(1)
         }
     }
-    pub fn add_source(&self, wss: T, connection_id: usize) {
+    pub fn map_source_to_sink(&self, sink_addr: T, source_id: usize) {
         let mut locked = self.map.lock().unwrap();
-        locked.insert(connection_id, wss);
+        locked.insert(source_id, sink_addr);
     }
 
-    pub fn remove_source(&self, connection_id: usize) {
+    pub fn unmap_source_from_sink(&self, source_id: usize) {
         let mut locked = self.map.lock().unwrap();
-        locked.remove(&connection_id);
+        locked.remove(&source_id);
     }
 
-    pub fn add_sink(&self, _wss: T) {
-        // TODO: This changes when working with websockets
-        unimplemented!()
-    }
-
-    fn remove_sink<C>(&self, wss: T, cb: C) 
+    fn remove_sink<C>(&self, sink_addr: T, cb: C) 
         where C: Fn(usize)
     {
         let mut locked = self.map.lock().unwrap();
         let mut remove = Vec::new();
         for (c, addr) in locked.iter() {
-            if wss == *addr {
+            if sink_addr == *addr {
                 remove.push(*c);
             }
         }
@@ -74,26 +72,27 @@ impl<M: Sized + Default + Clone + Send + Debug, T: PartialEq + Clone + EventSend
         }
     }
 
-    pub fn by_connection_id(&self, connection_id: usize) -> Option<T> {
+    /// Returns a sink address associated with the given source id.
+    pub fn by_source_id(&self, source_id: usize) -> Option<T> {
         let locked = self.map.lock().unwrap();
-        let addr = locked.get(&connection_id);
+        let addr = locked.get(&source_id);
         addr.cloned()
     }
 }
-pub struct DynamicMultiReducer<M: Sized + Default + Debug + Clone + Send, SourceSinkAddr: PartialEq + Clone + EventSender<M> > {
-    pub map: Arc<InnerMap<M, SourceSinkAddr>>,
+pub struct DynamicMultiReducer<M: Sized + Default + Debug + Clone + Send, SinkAddr: PartialEq + Clone + EventEmitter<M> > {
+    pub map: Arc<InnerMap<M, SinkAddr>>,
     event_rx: Mutex<Option<Receiver<Event<M>>>>,
     event_tx: Sender<Event<M>>,
-    next_connection_id: AtomicUsize,
+    next_source_id: AtomicUsize,
 }
 
-impl<M: Sized + Default + Debug + Clone + Send + 'static, SourceSinkAddr: PartialEq + Clone + EventSender<M>> DynamicMultiReducer<M, SourceSinkAddr> {
-    pub fn future(&self, source_sink_factory: fn(usize, SourceSinkAddr) -> Box<dyn SourceSink<M>>,
-    stream_init_factory: Box<dyn InitStreamFactory<M>>
-) -> DynamicMultiReducerFuture<M, SourceSinkAddr> {
+impl<M: Sized + Default + Debug + Clone + Send + 'static, SinkAddr: PartialEq + Clone + EventEmitter<M>> DynamicMultiReducer<M, SinkAddr> {
+    pub fn future(&self, source_sink_factory: fn(usize, SinkAddr) -> Box<dyn Sink<M>>,
+    stream_init_factory: Box<dyn StreamProcessorFactory<M>>
+) -> DynamicMultiReducerFuture<M, SinkAddr> {
         DynamicMultiReducerFuture {
             streams: Default::default(),
-            map: self.map.clone(),
+            source_id_to_sink_addr: self.map.clone(),
             event_tx: self.event_tx.clone(),
             source_sink_factory,
             stream_init_factory,
@@ -110,43 +109,46 @@ impl<M: Sized + Default + Debug + Clone + Send + 'static, SourceSinkAddr: Partia
         DynamicMultiReducer {
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
-            next_connection_id: AtomicUsize::new(1),
-            map: Arc::new(InnerMap::<M, SourceSinkAddr>::new()),
+            next_source_id: AtomicUsize::new(1),
+            map: Arc::new(InnerMap::<M, SinkAddr>::new()),
         }
     }
 
-    pub fn remove_sink(&self, wss: SourceSinkAddr) {
+    pub fn remove_sink(&self, wss: SinkAddr) {
         let tx = self.event_tx.clone();
         self.map.remove_sink(wss, move |c| {
             info!("Removing connection: {}", c);
-            tx.try_send(Event::Disconnect { connection_id: c }).unwrap_or_default();
+            tx.try_send(Event::Disconnect { source_id: c }).unwrap_or_default();
         })
     }
 
-    pub fn shutdown_source(&self, connection_id: usize) {
-        self.event_tx.try_send(Event::Disconnect { connection_id }).unwrap_or_default();
+    pub fn shutdown_source(&self, source_id: usize) {
+        self.event_tx.try_send(Event::Disconnect { source_id }).unwrap_or_default();
     }
 
-    pub fn connect(&self, reserved: usize, server_address: String, proxy: Option<String>, addr: SourceSinkAddr) -> usize {
-        let connection_id = self.next_connection_id.load(Ordering::SeqCst);
-        self.map.add_source(addr, connection_id);
-        Connector::connect(reserved, server_address, proxy, connection_id, self.event_tx.clone());
-        self.next_connection_id.fetch_add(1, Ordering::SeqCst);
-        
-        connection_id
+    /// Connects a new source to the sink
+    pub fn connect(&self, reserved: usize, server_address: String, proxy: Option<String>, addr: SinkAddr) -> usize {
+        let source_id = self.next_source_id.fetch_add(1, Ordering::SeqCst);
+        self.map.map_source_to_sink(addr, source_id);
+        Connector::connect(reserved, server_address, proxy, source_id, self.event_tx.clone());
+        source_id
     }
 }
 
-pub struct DynamicMultiReducerFuture<M: Sized  + Debug + Default + Clone + Send, SourceSinkAddr: PartialEq + Clone + EventSender<M>> {
-    map: Arc<InnerMap<M, SourceSinkAddr>>,
+pub struct DynamicMultiReducerFuture<M: Sized  + Debug + Default + Clone + Send, SinkAddr: PartialEq + Clone + EventEmitter<M>> {
+    /// Source ID to SinkAddr map.
+    source_id_to_sink_addr: Arc<InnerMap<M, SinkAddr>>,
+    /// Source ID to TcpStream map.
     streams: HashMap<usize, std::net::TcpStream>,
+    /// Inner receiver of network events.
     event_rx: Receiver<Event<M>>,
+    /// Inner sender of network events.
     event_tx: Sender<Event<M>>,
-    stream_init_factory: Box<dyn InitStreamFactory<M>>,
-    source_sink_factory: fn(usize, SourceSinkAddr) -> Box<dyn SourceSink<M>>
+    stream_init_factory: Box<dyn StreamProcessorFactory<M>>,
+    source_sink_factory: fn(usize, SinkAddr) -> Box<dyn Sink<M>>
 }
 
-impl<M: Sized + Default + Clone + Send + Debug + 'static, SourceSinkAddr: PartialEq + Clone + EventSender<M> + 'static> Future for DynamicMultiReducerFuture<M, SourceSinkAddr> {
+impl<M: Sized + Default + Clone + Send + Debug + 'static, SinkAddr: PartialEq + Clone + EventEmitter<M> + 'static> Future for DynamicMultiReducerFuture<M, SinkAddr> {
     type Output = ();
 
     fn poll(
@@ -156,11 +158,11 @@ impl<M: Sized + Default + Clone + Send + Debug + 'static, SourceSinkAddr: Partia
         match self.event_rx.poll_recv(cx) {
             std::task::Poll::Ready(Some(e)) => {
                 match e {
-                    Event::ConnectionFailed { connection_id } => {
-                        self.map.remove_source(connection_id);
+                    Event::ConnectionFailed { source_id, reserved: _ } => {
+                        self.source_id_to_sink_addr.unmap_source_from_sink(source_id);
                     }
-                    Event::Disconnect {connection_id} => {
-                        if let Some(stream) = self.streams.get(&connection_id) {
+                    Event::Disconnect {source_id} => {
+                        if let Some(stream) = self.streams.get(&source_id) {
                             match stream.shutdown(std::net::Shutdown::Both) {
                                 Ok(_)=>{}
                                 Err(err) => {
@@ -171,34 +173,41 @@ impl<M: Sized + Default + Clone + Send + Debug + 'static, SourceSinkAddr: Partia
                     }
                     Event::Connected {
                         reserved,
-                        connection_id,
+                        source_id,
                         stream,
                     } => {
-                        info!("Connected, {}", connection_id);
-                        let (data_tx, data_rx) = tokio::sync::mpsc::channel(128);
-                        let mut addr = self.map.by_connection_id(connection_id).expect("no such connection");
+                        info!("Connected, {}", source_id);
+                        let (data_tx, data_rx) = tokio::sync::mpsc::channel(512);
+                        let mut addr = self.source_id_to_sink_addr.by_source_id(source_id).expect("no such connection");
                         let mut source_sink = (self.source_sink_factory)(reserved, addr.clone());
                         source_sink.set_receiver(data_rx);
                         tokio::spawn(source_sink);
-                        let (sender_tx, sender_rx) = tokio::sync::mpsc::channel(64);
-                        addr.send(Event::Connected2 {
+                        let (sink_to_source_tx, sink_to_source_rx) = tokio::sync::mpsc::channel(128);
+                        addr.emit(Event::Connected2 {
                             reserved,
-                            sender: sender_tx,
-                            connection_id,
+                            sink_to_source: sink_to_source_tx,
+                            source_id: source_id,
                         });
-                        self.streams.insert(connection_id, stream.try_clone().unwrap());
-                        self.stream_init_factory.new_stream_initializer(data_tx, sender_rx, connection_id, reserved).init_stream
-                        (
+                        self.streams.insert(source_id, stream.try_clone().unwrap());
+                        let event_emitter = self.event_tx.clone();
+                        self.stream_init_factory.build(
+                            data_tx,
+                            sink_to_source_rx,
+                            source_id,
+                            reserved
+                        ).setup(
                             reserved,
-                            connection_id,
+                            source_id,
                             tokio::net::TcpStream::from_std(stream).unwrap(),
-                            self.event_tx.clone(),
+                            event_emitter,
                         )
                     }
-                    Event::Disconnected { connection_id } => {
-                        self.streams.remove(&connection_id);
-                        info!("Disconnected: {}", connection_id);
-                        self.map.remove_source(connection_id);
+                    Event::Disconnected { source_id } => {
+                        self.streams.remove(&source_id);
+                        info!("Disconnected: {}", source_id);
+                        let mut addr = self.source_id_to_sink_addr.by_source_id(source_id).expect("no such connection");
+                        addr.emit(Event::Disconnected { source_id });
+                        self.source_id_to_sink_addr.unmap_source_from_sink(source_id);
                     }
                     _ => {}
                 }
@@ -212,12 +221,11 @@ impl<M: Sized + Default + Clone + Send + Debug + 'static, SourceSinkAddr: Partia
     }
 }
 
-pub trait SourceSink<M: Sized + Default + Clone + Send>: Future<Output = ()> + Send + Unpin {
+pub trait Sink<M: Sized + Default + Clone + Send>: Future<Output = ()> + Send + Unpin {
     fn set_receiver(&mut self, receiver: Receiver<(usize, M)>);
 }
 
-
-pub trait EventSender<M: Sized + Default + Clone + Send> {
-    fn send(&mut self, event: Event<M>);
+pub trait EventEmitter<M: Sized + Default + Clone + Send> {
+    fn emit(&mut self, event: Event<M>);
 }
 
