@@ -94,8 +94,8 @@ impl<M: Sized + Default + Debug + Clone + Send + 'static, SinkAddr: PartialEq + 
             streams: Default::default(),
             source_id_to_sink_addr: self.map.clone(),
             event_tx: self.event_tx.clone(),
-            source_sink_factory,
-            stream_init_factory,
+            sink_factory: source_sink_factory,
+            stream_processor_factory: stream_init_factory,
             event_rx: self
                 .event_rx
                 .lock()
@@ -144,8 +144,8 @@ pub struct DynamicMultiReducerFuture<M: Sized  + Debug + Default + Clone + Send,
     event_rx: Receiver<Event<M>>,
     /// Inner sender of network events.
     event_tx: Sender<Event<M>>,
-    stream_init_factory: Box<dyn StreamProcessorFactory<M>>,
-    source_sink_factory: fn(usize, SinkAddr) -> Box<dyn Sink<M>>
+    stream_processor_factory: Box<dyn StreamProcessorFactory<M>>,
+    sink_factory: fn(usize, SinkAddr) -> Box<dyn Sink<M>>
 }
 
 impl<M: Sized + Default + Clone + Send + Debug + 'static, SinkAddr: PartialEq + Clone + EventEmitter<M> + 'static> Future for DynamicMultiReducerFuture<M, SinkAddr> {
@@ -179,7 +179,7 @@ impl<M: Sized + Default + Clone + Send + Debug + 'static, SinkAddr: PartialEq + 
                         info!("Connected, {}", source_id);
                         let (data_tx, data_rx) = tokio::sync::mpsc::channel(512);
                         let mut addr = self.source_id_to_sink_addr.by_source_id(source_id).expect("no such connection");
-                        let mut source_sink = (self.source_sink_factory)(reserved, addr.clone());
+                        let mut source_sink = (self.sink_factory)(reserved, addr.clone());
                         source_sink.set_receiver(data_rx);
                         tokio::spawn(source_sink);
                         let (sink_to_source_tx, sink_to_source_rx) = tokio::sync::mpsc::channel(128);
@@ -190,7 +190,7 @@ impl<M: Sized + Default + Clone + Send + Debug + 'static, SinkAddr: PartialEq + 
                         });
                         self.streams.insert(source_id, stream.try_clone().unwrap());
                         let event_emitter = self.event_tx.clone();
-                        self.stream_init_factory.build(
+                        self.stream_processor_factory.build(
                             data_tx,
                             sink_to_source_rx,
                             source_id,
